@@ -1,0 +1,31 @@
+[package]
+name = "cogware-canclient"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+adafruit-qt-py-rp2040 = "0.8.0"
+cortex-m-rt = "0.7.3"
+embedded-alloc = "0.5.1"
+embedded-graphics = "0.8.1"
+embedded-hal = "1.0.0"
+embedded_hal_0_2 = { package = "embedded-hal", version = "0.2.7", features = [
+  "unproven",
+] }
+fugit = "0.3.7"
+mcp2515 = "0.2.2"
+panic-halt = "0.2.0"
+rand = { version = "0.8.3", features = ["small_rng"], default-features = false }
+rp2040-boot2 = "0.3.0"
+rp2040-hal = "0.10.2"
+smart-leds = "0.3.0"
+ssd1306 = "0.8.4"
+ws2812-pio = "0.8.0"
+cogware-can = {path = "../CogwareCan"}
+usb-device = "0.3.2"
+usbd-serial = "0.2.2"
+
+[profile.dev]
+panic = "abort"
+[profile.release]
+panic = "abort"
