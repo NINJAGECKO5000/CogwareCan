@@ -124,7 +124,7 @@ fn main() -> ! {
     let cores = mc.cores();
     let core1 = &mut cores[1];
     let _test = core1.spawn(unsafe { &mut CORE1_STACK.mem }, move || {
-        core1_task(can, &timer)
+        core1_task(can)
     });
 
     //=======================================^^^ everything above is init=====================
@@ -183,13 +183,12 @@ fn core1_task(
         >,
         Pin<Gpio19, FunctionSio<SioOutput>, PullDown>,
     >,
-    timer: &Timer,
 ) {
     let mut cliaskedaddr = Vec::new();
     let masterack = Id::Standard(StandardId::ZERO);
     let clirequest = Id::Standard(StandardId::new(0x15).expect("bad address"));
     loop {
-        //let timeout = timer.get_counter().ticks() + 16_000;
+        //let timeout = timer.get_counter().ticks() + 15_000;
 
         match can.read_message() {
             Ok(frame) => {
