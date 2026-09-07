@@ -6,7 +6,6 @@ edition = "2021"
 [dependencies]
 adafruit-qt-py-rp2040 = "0.8.0"
 cortex-m-rt = "0.7.3"
-embedded-alloc = "0.5.1"
 embedded-graphics = "0.8.1"
 embedded-hal = "1.0.0"
 embedded_hal_0_2 = { package = "embedded-hal", version = "0.2.7", features = [

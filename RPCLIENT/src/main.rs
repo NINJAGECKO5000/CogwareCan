@@ -1,33 +1,30 @@
-//! Continuously changes the color of the Neopixel on a Adafruit QT Py RP2040 board
+//! CogwareCan display: subscribes to the gauges it shows, renders them in
+//! whatever units it likes, and listens for over-the-air updates.
+//!
+//! The display never knows which ECU is on the other end. It asks for gauge
+//! IDs, reads canonical values back, and converts for presentation. Swapping
+//! a Speeduino for a Haltech, a MaxxECU or an OBD2 car changes nothing here.
+
 #![no_std]
 #![no_main]
-extern crate alloc;
+
 use adafruit_qt_py_rp2040::entry;
 use adafruit_qt_py_rp2040::{hal, Pins, XOSC_CRYSTAL_FREQ};
-use alloc::string::String;
+use core::fmt::Write;
+use core::iter::once;
 use panic_halt as _;
 
-use alloc::format;
-use alloc::vec::Vec;
-use rp2040_hal::gpio::bank0::*;
-use rp2040_hal::gpio::{FunctionSio, Pin, PullDown, SioOutput};
-use rp2040_hal::pac::SPI0;
-use rp2040_hal::spi::Enabled;
-use core::iter::once;
-use embedded_alloc::Heap;
+use cogware_can::xfer::{BufferSink, Receiver, RxState};
+use cogware_can::subscribe::Subscription;
+use cogware_can::{feed_frame, Gauge, Unit};
+use cogware_can::{AFR_PRI, BAT_VOL, CLNT, IAT, MAP, MASTERALIVE, RPM, TPS, VSS};
 use embedded_graphics::{
     mono_font::{ascii::FONT_5X7, MonoTextStyleBuilder},
     pixelcolor::BinaryColor,
     prelude::*,
-    primitives::{PrimitiveStyleBuilder, Rectangle},
     text::{Baseline, Text},
 };
-use mcp2515::{error::Error, frame::CanFrame, regs::OpMode, CanSpeed, McpSpeed, MCP2515};
-use ws2812_pio::Ws2812;
-
-use cogware_can::{cli_wri, Gauge, *};
 use embedded_hal::spi::MODE_0;
-use embedded_hal_0_2::can::{Frame, Id, StandardId};
 use fugit::RateExtU32;
 use hal::{
     clocks::{init_clocks_and_plls, Clock},
@@ -39,23 +36,41 @@ use hal::{
     Sio, I2C,
     {gpio::FunctionSpi, spi::Spi},
 };
+use mcp2515::{error::Error, regs::OpMode, CanSpeed, McpSpeed, MCP2515};
 use smart_leds::{brightness, SmartLedsWrite, RGB8};
 use ssd1306::{prelude::*, I2CDisplayInterface, Ssd1306};
+use ws2812_pio::Ws2812;
 
-#[global_allocator]
-static HEAP: Heap = Heap::empty();
-static CONFIGGAUGES: [u8; 10] = [0x20, 0x24, 0x25, 0x26, 0x28, 0x29, 0x2D, 0x35, 0x70,0x70];
+/// This display's address on the bus, fixed at build time. The master uses it
+/// to target over-the-air updates at one node instead of all of them.
+const NODE_ADDR: u8 = 0x07;
+
+/// Room to stage an incoming firmware image before it is applied.
+const OTA_STAGING: usize = 4096;
+
+/// The gauges this screen shows. Subscribing to only these keeps the bus
+/// quiet: the master broadcasts nothing nobody asked for.
+const WANTED: [u8; 9] = [
+    Gauge::Rpm.id() as u8,
+    Gauge::Map.id() as u8,
+    Gauge::Clnt.id() as u8,
+    Gauge::Iat.id() as u8,
+    Gauge::AfrPri.id() as u8,
+    Gauge::BatVol.id() as u8,
+    Gauge::Tps.id() as u8,
+    Gauge::Vss.id() as u8,
+    Gauge::Masteralive.id() as u8,
+];
+
+/// How long to gather gauge frames before redrawing, in timer ticks (µs).
+const FRAME_PERIOD_US: u64 = 100_000;
+
 #[entry]
 fn main() -> ! {
     let mut pac = pac::Peripherals::take().unwrap();
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
     let sio = Sio::new(pac.SIO);
-    let mut pins = Pins::new(
-        pac.IO_BANK0,
-        pac.PADS_BANK0,
-        sio.gpio_bank0,
-        &mut pac.RESETS,
-    );
+    let pins = Pins::new(pac.IO_BANK0, pac.PADS_BANK0, sio.gpio_bank0, &mut pac.RESETS);
     let clocks = init_clocks_and_plls(
         XOSC_CRYSTAL_FREQ,
         pac.XOSC,
@@ -67,10 +82,11 @@ fn main() -> ! {
     )
     .ok()
     .unwrap();
-    let mut i2c = I2C::i2c1(
+
+    let i2c = I2C::i2c1(
         pac.I2C1,
-        pins.sda1.reconfigure(), // sda
-        pins.scl1.reconfigure(), // scl
+        pins.sda1.reconfigure(),
+        pins.scl1.reconfigure(),
         400.kHz(),
         &mut pac.RESETS,
         125_000_000.Hz(),
@@ -79,19 +95,6 @@ fn main() -> ! {
     let mut display = Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
         .into_buffered_graphics_mode();
     display.init().unwrap();
-    let yoffset = 20;
-
-    let style = PrimitiveStyleBuilder::new()
-        .stroke_width(1)
-        .stroke_color(BinaryColor::On)
-        .build();
-
-    Rectangle::new(Point::new(0, 0), Size::new(127, 63))
-        .into_styled(style)
-        .draw(&mut display)
-        .unwrap();
-
-    display.flush().unwrap();
 
     let mut timer = Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
 
@@ -99,10 +102,7 @@ fn main() -> ! {
     let mosi = pins.mosi.into_function::<FunctionSpi>();
     let miso = pins.miso.into_function::<FunctionSpi>();
     let cs = pins.a3.into_push_pull_output();
-    let spi_dev = pac.SPI0;
-    let spi_pin_layout = (mosi, miso, sclk);
-
-    let spi = Spi::<_, _, _, 8>::new(spi_dev, spi_pin_layout).init(
+    let spi = Spi::<_, _, _, 8>::new(pac.SPI0, (mosi, miso, sclk)).init(
         &mut pac.RESETS,
         125_000_000u32.Hz(),
         16_000_000u32.Hz(),
@@ -112,211 +112,180 @@ fn main() -> ! {
     can.init(
         &mut timer,
         mcp2515::Settings {
-            mode: OpMode::Normal,          // Loopback for testing and example
-            can_speed: CanSpeed::Kbps1000, // Many options supported.
-            mcp_speed: McpSpeed::MHz16,    // Currently 16MHz and 8MHz chips are supported.
+            mode: OpMode::Normal,
+            can_speed: CanSpeed::Kbps1000,
+            mcp_speed: McpSpeed::MHz16,
             clkout_en: false,
         },
     )
     .unwrap();
 
-    {
-        use core::mem::MaybeUninit;
-        const HEAP_SIZE: usize = 1024;
-        static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
-        unsafe { HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE) }
-    }
-
     let led = pins.neopixel_data.into_function();
-
-    pins.neopixel_power
-        .into_push_pull_output_in_state(PinState::High);
-
+    pins.neopixel_power.into_push_pull_output_in_state(PinState::High);
     let (mut pio, sm0, _, _, _) = pac.PIO0.split(&mut pac.RESETS);
-    let mut ws = Ws2812::new(
-        led,
-        &mut pio,
-        sm0,
-        clocks.peripheral_clock.freq(),
-        timer.count_down(),
-    );
-    let mut _timer = timer; // rebind to force a copy of the timer
+    let mut ws = Ws2812::new(led, &mut pio, sm0, clocks.peripheral_clock.freq(), timer.count_down());
+
     let text_style = MonoTextStyleBuilder::new()
         .font(&FONT_5X7)
         .text_color(BinaryColor::On)
         .build();
+    let mut text = TextBuf::new();
 
-    let mut gaugelisten = Vec::new();
-    for i in CONFIGGAUGES {
-        gaugelisten.push(i);
+    // Draw one formatted line at (x, y). Rebuilt each frame into a fixed
+    // buffer, so the display needs no allocator.
+    macro_rules! row {
+        ($x:expr, $y:expr, $($arg:tt)*) => {{
+            text.clear();
+            let _ = write!(text, $($arg)*);
+            let _ = Text::with_baseline(text.as_str(), Point::new($x, $y), text_style, Baseline::Top)
+                .draw(&mut display);
+        }};
     }
+    /// A row showing a gauge value, or "--" while it has never been received.
+    macro_rules! gauge_row {
+        ($x:expr, $y:expr, $label:literal, $val:expr, $fmt:literal) => {{
+            match $val {
+                Some(v) => row!($x, $y, concat!($label, ": ", $fmt), v),
+                None => row!($x, $y, concat!($label, ": --")),
+            }
+        }};
+    }
+
+    // ---- Subscribe. Ask the master for the gauge IDs this screen shows and
+    // keep asking until every one has been acknowledged.
     display.clear(BinaryColor::Off).ok();
-    //let mut can = clirequest(can, gaugelisten.clone());
-    let masterack = Id::Standard(StandardId::ZERO);
-    let clirequest = Id::Standard(StandardId::new(0x015).expect("bad address"));
-    for val in &gaugelisten {
-        'read: loop {
-            ws.write(brightness(once(wheel(0)), 32)).unwrap();
-            match can.read_message() {
-                Ok(frame) => {
-                    if frame.id() == masterack && frame.data()[0] == *val {
-                        ws.write(brightness(once(wheel(79)), 32)).unwrap(); // color to show master acknowledged
-                        break 'read;
-                    }
-                }
-                Err(Error::NoMessage) => {}
-                Err(_) => {}
+    row!(0, 0, "CogwareCan node {}", NODE_ADDR);
+    row!(0, 10, "subscribing...");
+    display.flush().ok();
+
+    let mut sub = Subscription::new(&WANTED);
+    while !sub.is_complete() {
+        ws.write(brightness(once(wheel(0)), 32)).unwrap();
+        // Ask only for what has not been acknowledged yet, eight IDs a frame.
+        for req in sub.request() {
+            can.send_message(req).ok();
+        }
+        // Collect acks for a moment before asking again.
+        let deadline = timer.get_counter().ticks().wrapping_add(20_000);
+        while timer.get_counter().ticks() < deadline {
+            if let Ok(frame) = can.read_message() {
+                sub.feed(&frame);
             }
-            let frame = CanFrame::new(clirequest, &[*val]).unwrap();
-            can.send_message(frame).ok();
         }
     }
-    ws.write(brightness(once(wheel(180)), 32)).unwrap();
-    let mut dispgauge0: String;
-    let mut dispgauge1: String;
-    let mut dispgauge2: String;
-    let mut dispgauge3: String;
-    let mut dispgauge4: String;
-    let mut dispgauge5: String;
-    let mut dispgauge6: String;
-    let mut dispgauge7: String;
-    let mut dispgauge8: String;
-    let mut dispgauge9: String;
-    let mut bingus: u8 = 0;
+    ws.write(brightness(once(wheel(79)), 32)).unwrap();
+
+    // ---- Over-the-air updates. The master can push a new image to this node
+    // at any time; the receiver is a state machine we hand frames to.
+    let mut staging = [0u8; OTA_STAGING];
+    let mut ota = Receiver::new(NODE_ADDR, BufferSink::new(&mut staging));
+
+    let mut alive: u8 = 0;
     loop {
-        let timeout = timer.get_counter().ticks() + 16_000;
-        while timer.get_counter().ticks() <= timeout {
-            match can.read_message() {
-                Ok(frame) => {
-                    // bingles = format!("{:?} {:?}", frame.id(), frame.data());
-                    if let Id::Standard(standard_id) = frame.id() {
-                        let primitive_id: u16 = standard_id.as_raw();
-                        if gaugelisten.contains(&primitive_id.try_into().unwrap()) {
-                            cli_wri(frame, primitive_id);
-                        }
-                    }
-                }
-                Err(Error::NoMessage) => {}
-                Err(_) => panic!("Oh no!"),
+        // ---- Gather. Every frame is either a gauge, an update frame, or
+        // something for another node. None of them can panic the display.
+        let deadline = timer.get_counter().ticks().wrapping_add(FRAME_PERIOD_US);
+        while timer.get_counter().ticks() < deadline {
+            let frame = match can.read_message() {
+                Ok(f) => f,
+                // Nothing waiting, or a controller error: try again.
+                Err(Error::NoMessage) | Err(_) => continue,
+            };
+            if feed_frame(&frame).is_ok() {
+                continue;
+            }
+            // Not a gauge: it may be part of an update aimed at this node.
+            if let Some(reply) = ota.feed(&frame) {
+                can.send_message(reply).ok();
             }
         }
-        let boost = (MAP.get() as f64 * 0.145038) - 14.5038;
-        dispgauge0 = format!("STA: {:?}", STA_TIME.get());
-        dispgauge1 = format!("BOOST: {:.1}", boost);
-        dispgauge2 = format!("IAT: {:?}", ((IAT.get() * 2) -91));
-        dispgauge3 = format!("CLNT: {:?}", ((CLNT.get() * 2) -91));
-        dispgauge4 = format!("BATVOL: {:?}", BAT_VOL.get());
-        dispgauge5 = format!("AFR: {:?}", (AFR_PRI.get() as f64 / 10.00));
-        dispgauge6 = format!("RPM: {:?}", RPM.get());
-        dispgauge7 = format!("TPS: {:?}", TPS.get());
-        dispgauge8 = format!("CliAlive: {:?}", bingus);
-        dispgauge9 = format!("ServAli: {:?}", MASTERALIVE.get());
-        bingus = bingus.wrapping_add(1);
+
+        // ---- Render. Gauges hold canonical units; the screen picks its own.
         display.clear(BinaryColor::Off).ok();
 
-        Text::with_baseline(&dispgauge0, Point::new(0, 10), text_style, Baseline::Top)
-            .draw(&mut display)
-            .unwrap();
-        Text::with_baseline(&dispgauge1, Point::new(0, 20), text_style, Baseline::Top)
-            .draw(&mut display)
-            .unwrap();
-        Text::with_baseline(&dispgauge2, Point::new(0, 30), text_style, Baseline::Top)
-            .draw(&mut display)
-            .unwrap();
-        Text::with_baseline(&dispgauge3, Point::new(0, 40), text_style, Baseline::Top)
-            .draw(&mut display)
-            .unwrap();
-        Text::with_baseline(&dispgauge4, Point::new(0, 50), text_style, Baseline::Top)
-            .draw(&mut display)
-            .unwrap();
-        Text::with_baseline(&dispgauge5, Point::new(60, 10), text_style, Baseline::Top)
-            .draw(&mut display)
-            .unwrap();
-        Text::with_baseline(&dispgauge6, Point::new(60, 20), text_style, Baseline::Top)
-            .draw(&mut display)
-            .unwrap();
-        Text::with_baseline(&dispgauge7, Point::new(60, 30), text_style, Baseline::Top)
-            .draw(&mut display)
-            .unwrap();
+        if ota.state() == RxState::Receiving {
+            // An update is in flight. Show progress instead of the dashboard.
+            let (done, total) = ota.progress();
+            row!(0, 10, "FIRMWARE UPDATE");
+            row!(0, 25, "node {} receiving", NODE_ADDR);
+            row!(0, 40, "{} / {} bytes", done, total);
+        } else {
+            gauge_row!(0, 0, "RPM", RPM.get(), "{}");
+            // MAP is absolute; subtract atmospheric to show boost like a gauge.
+            gauge_row!(0, 10, "BST", MAP.to(Unit::PSI).map(|p| p - 14.7), "{:.1}");
+            gauge_row!(0, 20, "CLT", CLNT.as_f32(), "{:.0}C");
+            gauge_row!(0, 30, "IAT", IAT.as_f32(), "{:.0}C");
+            gauge_row!(0, 40, "BAT", BAT_VOL.as_f32(), "{:.1}V");
+            gauge_row!(0, 50, "TPS", TPS.as_f32(), "{:.0}%");
 
-        Text::with_baseline(&dispgauge8, Point::new(60, 40), text_style, Baseline::Top)
-            .draw(&mut display)
-            .unwrap();
+            gauge_row!(66, 0, "AFR", AFR_PRI.as_f32(), "{:.1}");
+            gauge_row!(66, 10, "LAM", AFR_PRI.reading().and_then(|r| r.lambda()), "{:.2}");
+            gauge_row!(66, 20, "MPH", VSS.to(Unit::MPH), "{:.0}");
+            gauge_row!(66, 30, "F", CLNT.to(Unit::FAHRENHEIT), "{:.0}");
+            // MASTERALIVE counts up while the ECU link is healthy and clears
+            // when it drops, so "--" here means the master lost the ECU.
+            gauge_row!(66, 40, "SRV", MASTERALIVE.get(), "{}");
+            row!(66, 50, "CLI: {}", alive);
+        }
 
-        Text::with_baseline(&dispgauge9, Point::new(60, 50), text_style, Baseline::Top)
-            .draw(&mut display)
-            .unwrap();
-        display.flush().unwrap();
-
-        ws.write(brightness(
-            once(wheel(STA_TIME.get().try_into().unwrap())),
-            32,
-        ))
-        .unwrap();
+        display.flush().ok();
+        alive = alive.wrapping_add(1);
+        ws.write(brightness(once(wheel(link_colour(alive))), 32)).unwrap();
     }
 }
+
+/// Green-ish while the master's heartbeat is running, red when it has stopped.
+fn link_colour(alive: u8) -> u8 {
+    if MASTERALIVE.is_set() {
+        alive
+    } else {
+        0
+    }
+}
+
+/// A short line of text built without an allocator. Writes past the end are
+/// dropped, which for a 128-pixel display is the right failure.
+struct TextBuf {
+    buf: [u8; 24],
+    len: usize,
+}
+
+impl TextBuf {
+    const fn new() -> Self {
+        TextBuf { buf: [0; 24], len: 0 }
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+impl Write for TextBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.len < self.buf.len() {
+                self.buf[self.len] = b;
+                self.len += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Convert a number from `0..=255` to an RGB color triplet.
-///
-/// The colours are a transition from red, to green, to blue and back to red.
 fn wheel(mut wheel_pos: u8) -> RGB8 {
     wheel_pos = 255 - wheel_pos;
     if wheel_pos < 85 {
-        // No green in this sector - red and blue only
         (255 - (wheel_pos * 3), 0, wheel_pos * 3).into()
     } else if wheel_pos < 170 {
-        // No red in this sector - green and blue only
         wheel_pos -= 85;
         (0, wheel_pos * 3, 255 - (wheel_pos * 3)).into()
     } else {
-        // No blue in this sector - red and green only
         wheel_pos -= 170;
         (wheel_pos * 3, 255 - (wheel_pos * 3), 0).into()
     }
-}
-fn clirequest(
-    mut can: MCP2515<
-        Spi<
-            Enabled,
-            SPI0,
-            (
-                Pin<Gpio3, FunctionSpi, PullDown>,
-                Pin<Gpio4, FunctionSpi, PullDown>,
-                Pin<Gpio6, FunctionSpi, PullDown>,
-            ),
-        >,
-        Pin<Gpio26, FunctionSio<SioOutput>, PullDown>,
-    >,
-    vecboi: Vec<u8>,
-) -> MCP2515<
-    Spi<
-        Enabled,
-        SPI0,
-        (
-            Pin<Gpio3, FunctionSpi, PullDown>,
-            Pin<Gpio4, FunctionSpi, PullDown>,
-            Pin<Gpio6, FunctionSpi, PullDown>,
-        ),
-    >,
-    Pin<Gpio26, FunctionSio<SioOutput>, PullDown>,
-> {
-    let masterack = Id::Standard(StandardId::ZERO);
-    let clirequest = Id::Standard(StandardId::new(0x015).expect("bad address"));
-
-    for val in &vecboi {
-        'read: loop {
-            match can.read_message() {
-                Ok(frame) => {
-                    if frame.id() == masterack && frame.data()[0] == *val {
-                        break 'read;
-                    }
-                }
-                Err(Error::NoMessage) => {}
-                Err(_) => panic!("Oh no!"),
-            }
-            let frame = CanFrame::new(clirequest, &[*val]).unwrap();
-            can.send_message(frame).ok();
-        }
-    }
-
-    can
 }

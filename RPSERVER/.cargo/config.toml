@@ -1,0 +1,10 @@
+# Without this the firmware does not link: cortex-m-rt's link.x supplies the
+# reset vector and consumes memory.x, and --nmagic keeps sections unpadded.
+[build]
+target = "thumbv6m-none-eabi"
+
+[target.thumbv6m-none-eabi]
+rustflags = [
+  "-C", "link-arg=--nmagic",
+  "-C", "link-arg=-Tlink.x",
+]

@@ -1,3 +1,39 @@
-CogwareCan/target
-RPCLIENT/target
-RPSERVER/target
+# Build output. `target/` rather than the three rooted paths this replaces:
+# the repository holds three crates side by side, each with its own, and a
+# rule listing them by name misses every crate added after it was written.
+target/
+**/*.rs.bk
+*.pdb
+
+# Firmware images and stray binaries. The RP2040 crates emit these beside the
+# crate when an image is converted or flashed by hand, and none of them is
+# source. `memory.x` is a linker script, is tracked, and is not matched here.
+*.uf2
+*.elf
+*.bin
+*.hex
+*.map
+a.out
+*.exe
+*.so
+*.dylib
+*.o
+core
+
+# The tooling this happens to be written with. None of it describes the bus
+# spec, all of it changes every session, and a repository is better for not
+# carrying somebody else's editor state.
+.claude/
+.claude-flow/
+CLAUDE.md
+.mcp.json
+/memory/
+/coordination/
+.swarm/
+.hive-mind/
+.roo/
+.roomodes
+
+# The house rules the code is written to: kept out of the published tree on
+# purpose, so anyone reading the repository is reading the spec.
+instructions.md

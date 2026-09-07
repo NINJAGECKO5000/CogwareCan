@@ -1,132 +1,174 @@
-#![no_std]
-#![no_main]
+//! CogwareCan: one crate holding the gauge spec, the ECU converters, and the
+//! CAN framing, so a server or display only ever talks to this crate.
+//!
+//! Server side (ECU in, CAN out):
+//! ```ignore
+//! speeduino::parse_n(&uart_packet)?;          // serial ECU bytes -> gauges
+//! haltech::SOURCE.feed_default(&ecu_frame);   // CAN-broadcast ECU -> gauges
+//! if let Some(f) = frame_for(Gauge::Rpm.id()) // gauge -> CAN frame
+//!     { can.send_message(f)?; }
+//! ```
+//!
+//! Display side (CAN in, gauges out):
+//! ```ignore
+//! feed_frame(&frame)?;                       // CAN frame -> gauge
+//! let rpm = RPM.get_or(0);                   // canonical units, see `Unit`
+//! let clt = CLNT.as_f32();                   // 87.5 for 87.5 °C, None if unset
+//! let psi = MAP.to(Unit::PSI);               // unit conversion, see `units`
+//! ```
+//!
+//! Adding an ECU: one new module holding a `CanSource` table (CAN broadcast)
+//! or a `Field` table plus a packet parser (serial). See `decode`. OBD2 is
+//! request/response and lives in `obd2`.
+//!
+//! Bus housekeeping: `protocol` holds the ID map and node addressing,
+//! `subscribe` the display-to-master gauge subscriptions, and `xfer` the
+//! master-to-node file transfer used for over-the-air updates. All three are
+//! frame in, frame out, with no driver or timer of their own.
 
+#![cfg_attr(not(test), no_std)]
+
+pub mod crc;
+pub mod decode;
+pub mod ecumaster;
 mod gauge;
+pub mod haltech;
+pub mod maxxecu;
+pub mod megasquirt;
+pub mod obd2;
+pub mod rusefi;
+pub mod speeduino;
+pub mod subscribe;
+pub mod units;
+pub mod xfer;
+
+pub use decode::CanSource;
 pub use gauge::*;
+pub use units::{Quantity, Reading, Unit};
+
+/// Every CAN-broadcast ECU this crate understands. A server that does not
+/// know which ECU is attached can try each in turn:
+/// `CAN_SOURCES.iter().find_map(|s| s.feed_default(&frame))`.
+pub static CAN_SOURCES: &[&CanSource] = &[
+    &rusefi::SOURCE,
+    &haltech::SOURCE,
+    &megasquirt::SOURCE,
+    &maxxecu::SOURCE,
+    &ecumaster::SOURCE,
+];
+
+use embedded_hal_0_2::can::{Frame, Id, StandardId};
 use mcp2515::frame::CanFrame;
 
-pub fn cli_wri(frame: CanFrame, id: u16) {
-    Gauge::from_repr(id)
-        .expect("bad ID fucking idiot")
-        .set_from_frame(frame);
+/// The CAN ID map of the display bus.
+///
+/// | Range           | Use                                                    |
+/// |-----------------|--------------------------------------------------------|
+/// | 0x000..=0x01F   | Reserved: bus control and node addressing (this module) |
+/// | 0x020..=0x6FF   | Gauges, one ID each (see `gauge`)                       |
+/// | 0x700..=0x7FF   | Left clear for OBD2 (0x7DF request, 0x7E8.. replies)    |
+///
+/// Inside the reserved range: 0x000 master ack, 0x010..=0x012 file transfer
+/// (see `xfer`), 0x015 client subscribe request. Every node on the bus has a
+/// one-byte node address chosen by the firmware that embeds this crate;
+/// `NODE_MASTER` is the server and `NODE_BROADCAST` addresses all nodes.
+pub mod protocol {
+    use super::*;
+
+    /// Lowest and highest IDs reserved for bus control.
+    pub const RESERVED_ID_MIN: u16 = 0x000;
+    pub const RESERVED_ID_MAX: u16 = 0x01F;
+    /// Server acknowledges a client's subscription; payload is the gauge ID echoed back.
+    pub const MASTER_ACK_ID: u16 = 0x000;
+    /// Client asks the server to start broadcasting gauges; payload is up to 8 gauge IDs.
+    pub const CLIENT_REQUEST_ID: u16 = 0x015;
+    /// First ID available to gauges.
+    pub const GAUGE_ID_MIN: u16 = 0x020;
+    /// Top of the gauge range.
+    pub const GAUGE_ID_MAX: u16 = 0x6FF;
+
+    /// Node address of the master (the ECU-facing server).
+    pub const NODE_MASTER: u8 = 0x00;
+    /// Node address that every node answers to.
+    pub const NODE_BROADCAST: u8 = 0xFF;
+
+    pub fn is_reserved(id: u16) -> bool {
+        (RESERVED_ID_MIN..=RESERVED_ID_MAX).contains(&id)
+    }
+
+    pub fn is_gauge_range(id: u16) -> bool {
+        (GAUGE_ID_MIN..=GAUGE_ID_MAX).contains(&id)
+    }
+
+    /// Build a standard-ID frame; `None` if the ID is over 11 bits or the payload over 8 bytes.
+    pub fn frame(id: u16, data: &[u8]) -> Option<CanFrame> {
+        CanFrame::new(Id::Standard(StandardId::new(id)?), data)
+    }
+
+    /// Standard ID of a frame, or `None` for extended IDs.
+    pub fn id_of(frame: &CanFrame) -> Option<u16> {
+        match frame.id() {
+            Id::Standard(s) => Some(s.as_raw()),
+            Id::Extended(_) => None,
+        }
+    }
+
+    /// Frame a client sends to subscribe to `ids` (at most 8 per frame).
+    pub fn request_frame(ids: &[u8]) -> Option<CanFrame> {
+        frame(CLIENT_REQUEST_ID, ids)
+    }
+
+    /// Frame the server sends to acknowledge subscription to `id`.
+    pub fn ack_frame(id: u8) -> Option<CanFrame> {
+        frame(MASTER_ACK_ID, &[id])
+    }
+
+    pub fn is_request(frame: &CanFrame) -> bool {
+        id_of(frame) == Some(CLIENT_REQUEST_ID)
+    }
+
+    pub fn is_ack(frame: &CanFrame) -> bool {
+        id_of(frame) == Some(MASTER_ACK_ID)
+    }
 }
 
-pub fn server_framegen(id: u16) -> Option<CanFrame> {
-    Gauge::from_repr(id)?.to_frame()
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeedError {
+    /// Extended (29-bit) IDs are not part of the spec.
+    ExtendedId,
+    /// No gauge is defined at this ID (protocol frames land here too).
+    UnknownId(u16),
+    /// Payload length does not match the gauge's wire width.
+    BadLength { id: u16, expected: usize, got: usize },
 }
 
-pub fn speeduino_n_writer(buf: [u8; 126]) {
-    STA_TIME.set(buf[3] as _);
-    STA_STATUS1.set(buf[4] as _);
-    STA_ENG.set(buf[5] as _);
-    DWELL.set(buf[6] as _);
-    MAP.set_from_bytes(&buf[7..=8]);
-    IAT.set(buf[9] as _);
-    CLNT.set(buf[10] as _);
-    BAT_CORRECT.set(buf[11] as _);
-    BAT_VOL.set(buf[12] as _);
-    AFR_PRI.set(buf[13] as _);
-    EGO_CORRECT.set(buf[14] as _);
-    IAT_CORRECT.set(buf[15] as _);
-    WUE_CORRECT.set(buf[16] as _);
-    RPM.set_from_bytes(&buf[17..=18]);
-    ACCEL_ENRICH.set(buf[19] as _);
-    GAMME_E.set(buf[20] as _);
-    VE.set(buf[21] as _);
-    AFR_TARGET.set(buf[22] as _);
-    PULSE_WIDTH1.set_from_bytes(&buf[23..=24]);
-    TPS_DOT.set(buf[25] as _);
-    CUR_SPARK_ADVANCE.set(buf[26] as _);
-    TPS.set(buf[27] as _);
-    LOOP_PS.set_from_bytes(&buf[28..=29]);
-    FREE_MEM.set_from_bytes(&buf[30..=31]);
-    BOOST_TARGET.set(buf[32] as _);
-    BOOST_PWM.set(buf[33] as _);
-    STA_SPARK.set(buf[34] as _);
-    RPM_DOT.set_from_bytes(&buf[35..=36]);
-    ETHANOL_PERCENT.set(buf[37] as _);
-    FLEX_CORRECT.set(buf[38] as _);
-    FLEX_IGN_CORRECT.set(buf[39] as _);
-    IDLE_LOAD.set(buf[40] as _);
-    TEST_OUTPUTS.set(buf[41] as _);
-    AFR_SEC.set(buf[42] as _);
-    BARO.set(buf[43] as _);
-    TPS_ADC.set(buf[76] as _);
-    NEXT_ERROR.set(buf[77] as _);
-    STA_LAUNCH_CORRECT.set(buf[78] as _);
-    PULSE_WIDTH2.set_from_bytes(&buf[79..=80]);
-    PULSE_WIDTH3.set_from_bytes(&buf[81..=82]);
-    PULSE_WIDTH4.set_from_bytes(&buf[83..=84]);
-    STA_STATUS2.set(buf[85] as _);
-    ENG_PROTECT_STA.set(buf[86] as _);
-    FUEL_LOAD.set_from_bytes(&buf[87..=88]);
-    IGN_LOAD.set_from_bytes(&buf[89..=90]);
-    INJ_ANGLE.set_from_bytes(&buf[91..=92]);
-    IDLE_DUTY.set(buf[93] as _);
-    CL_IDLE_TARGET.set(buf[94] as _);
-    MAP_DOT.set(buf[95] as _);
-    VVT_ANGLE.set(buf[96] as _);
-    VVT_TARGET_ANGLE.set(buf[97] as _);
-    VVT_DUTY.set(buf[98] as _);
-    FLEX_BOOST_CORRECT.set_from_bytes(&buf[99..=100]);
-    BARO_CORRECTION.set(buf[101] as _);
-    ASE.set(buf[102] as _);
-    VSS.set_from_bytes(&buf[103..=104]);
-    GEAR.set(buf[105] as _);
-    FUEL_PRES.set(buf[106] as _);
-    OIL_PRES.set(buf[107] as _);
-    WMI_PW.set(buf[108] as _);
-    STA_STATUS4.set(buf[109] as _);
-    VVT_ANGLE2.set(buf[110] as _);
-    VVT_TARGET_ANGLE2.set(buf[111] as _);
-    VVT_DUTY2.set(buf[112] as _);
-    STATUS_OUT_STA.set(buf[113] as _);
-    FLEX_FUEL_TEMP.set(buf[114] as _);
-    FUEL_TEMP_CORRECT.set(buf[115] as _);
-    VE1.set(buf[116] as _);
-    VE2.set(buf[117] as _);
-    ADVANCE1.set(buf[118] as _);
-    ADVANCE2.set(buf[119] as _);
-    NITRO_STA.set(buf[120] as _);
-    SD_STA.set(buf[121] as _);
+/// Store an incoming gauge frame. Frames that are not gauges are rejected,
+/// never panicked on, so this is safe to call on every frame off the bus.
+pub fn feed_frame(frame: &CanFrame) -> Result<&'static GaugeData, FeedError> {
+    let id = match frame.id() {
+        Id::Standard(s) => s.as_raw(),
+        Id::Extended(_) => return Err(FeedError::ExtendedId),
+    };
+    let gauge = gauge_by_id(id).ok_or(FeedError::UnknownId(id))?;
+    gauge
+        .set_from_frame(frame)
+        .map_err(|FrameError::BadLength { expected, got }| FeedError::BadLength {
+            id,
+            expected,
+            got,
+        })?;
+    Ok(gauge)
 }
 
-#[allow(non_snake_case)]
-pub fn speeduino_A_writer(buf: [u8; 126]) {
-    STA_TIME.set(buf[2] as _);
-    STA_STATUS1.set(buf[3] as _);
-    STA_ENG.set(buf[4] as _);
-    DWELL.set(buf[5] as _);
-    MAP.set_from_bytes(&buf[6..=7]);
-    IAT.set(buf[8] as _);
-    CLNT.set(buf[9] as _);
-    BAT_CORRECT.set(buf[10] as _);
-    BAT_VOL.set(buf[11] as _);
-    AFR_PRI.set(buf[12] as _);
-    EGO_CORRECT.set(buf[13] as _);
-    IAT_CORRECT.set(buf[14] as _);
-    WUE_CORRECT.set(buf[15] as _);
-    RPM.set_from_bytes(&buf[16..=17]);
-    ACCEL_ENRICH.set(buf[18] as _);
-    GAMME_E.set(buf[19] as _);
-    VE.set(buf[20] as _);
-    AFR_TARGET.set(buf[21] as _);
-    PULSE_WIDTH1.set_from_bytes(&buf[22..=23]);
-    TPS_DOT.set(buf[24] as _);
-    CUR_SPARK_ADVANCE.set(buf[25] as _);
-    TPS.set(buf[26] as _);
-    LOOP_PS.set_from_bytes(&buf[27..=28]);
-    FREE_MEM.set_from_bytes(&buf[29..=30]);
-    BOOST_TARGET.set(buf[31] as _);
-    BOOST_PWM.set(buf[32] as _);
-    STA_SPARK.set(buf[33] as _);
-    RPM_DOT.set_from_bytes(&buf[34..=35]);
-    ETHANOL_PERCENT.set(buf[36] as _);
-    FLEX_CORRECT.set(buf[37] as _);
-    FLEX_IGN_CORRECT.set(buf[38] as _);
-    IDLE_LOAD.set(buf[39] as _);
-    TEST_OUTPUTS.set(buf[40] as _);
-    AFR_SEC.set(buf[41] as _);
-    BARO.set(buf[42] as _);
-    TPS_ADC.set(buf[75] as _);
+/// Frame for the gauge at `id`, or `None` if the ID is unknown or the gauge
+/// has not been set yet.
+pub fn frame_for(id: u16) -> Option<CanFrame> {
+    gauge_by_id(id)?.to_frame()
+}
+
+/// Reset every gauge to unset. Useful when the ECU link drops.
+pub fn clear_all() {
+    for g in ALL_GAUGES {
+        g.clear();
+    }
 }

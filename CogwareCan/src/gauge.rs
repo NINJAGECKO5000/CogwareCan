@@ -1,335 +1,325 @@
+//! The gauge specification: every value the displays can show, its CAN ID,
+//! its canonical unit, and how it travels on the wire.
+//!
+//! This table is the single source of truth. Converters (see `speeduino`)
+//! normalise whatever an ECU sends into the canonical unit and store it here;
+//! displays read from here and never need to know which ECU produced it.
+//!
+//! Stored values are fixed point: `physical value * unit.scale`. A coolant
+//! reading of 87.5 °C is stored as 875 because `Unit::CELSIUS.scale == 10`.
+//! Use `GaugeData::as_f32` when a float is wanted for display.
+
+use crate::units::{Reading, Unit};
 use core::cell::Cell;
-use core::ops::Deref;
 use critical_section::Mutex;
 use embedded_hal_0_2::can::{Frame, Id, StandardId};
 use mcp2515::frame::CanFrame;
-use strum_macros::FromRepr;
 use paste::paste;
 
-#[non_exhaustive]
-pub enum DataWidth {
+/// How a value is packed into a CAN frame: little endian, exactly this many bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wire {
     U8,
+    I8,
     U16,
     I16,
+    I32,
 }
 
-impl DataWidth {
-    pub fn num_bytes(&self) -> usize {
+impl Wire {
+    /// How many bytes this width occupies in a frame's payload.
+    // No `is_empty` beside it: a width is one, two or four bytes and never
+    // none, so the method clippy asks for could only ever return false.
+    #[allow(clippy::len_without_is_empty)]
+    pub const fn len(self) -> usize {
         match self {
-            DataWidth::U8 => 1,
-            DataWidth::U16 => 2,
-            DataWidth::I16 => 2,
+            Wire::U8 | Wire::I8 => 1,
+            Wire::U16 | Wire::I16 => 2,
+            Wire::I32 => 4,
         }
     }
+
+    /// Pack `value` into `out` and return how many bytes were used.
+    /// Values outside the wire range are clamped rather than wrapped.
+    pub fn encode(self, value: i32, out: &mut [u8; 4]) -> usize {
+        let n = self.len();
+        let clamped = match self {
+            Wire::U8 => value.clamp(0, u8::MAX as i32),
+            Wire::I8 => value.clamp(i8::MIN as i32, i8::MAX as i32),
+            Wire::U16 => value.clamp(0, u16::MAX as i32),
+            Wire::I16 => value.clamp(i16::MIN as i32, i16::MAX as i32),
+            Wire::I32 => value,
+        };
+        out[..n].copy_from_slice(&clamped.to_le_bytes()[..n]);
+        n
+    }
+
+    /// Unpack a payload. Returns `None` unless `data.len()` matches exactly.
+    pub fn decode(self, data: &[u8]) -> Option<i32> {
+        if data.len() != self.len() {
+            return None;
+        }
+        Some(match self {
+            Wire::U8 => data[0] as i32,
+            Wire::I8 => data[0] as i8 as i32,
+            Wire::U16 => u16::from_le_bytes([data[0], data[1]]) as i32,
+            Wire::I16 => i16::from_le_bytes([data[0], data[1]]) as i32,
+            Wire::I32 => i32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+        })
+    }
+}
+
+/// Which kind of source can populate a gauge. A display should only rely on
+/// a gauge being present if the attached source is at least this specific.
+/// Ordered, so `gauge.source <= Source::Standalone` is a valid check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Source {
+    /// Available from a stock car over OBD2 mode 01 as well as every standalone.
+    Common,
+    /// Standalone ECUs (Speeduino, Megasquirt, rusEFI, Haltech, MaxxECU,
+    /// ECUMaster, ...) broadcast it; OBD2 has no PID for it.
+    Standalone,
+    /// Speeduino-only: status bitfields, firmware diagnostics, and the
+    /// individual fuel-correction terms other ECUs only send summed.
+    Speeduino,
+    /// Bus housekeeping, produced by the server itself.
+    Protocol,
 }
 
 pub struct GaugeData {
+    pub name: &'static str,
     pub id: u16,
-    pub width: DataWidth,
-    pub value: Mutex<Cell<u32>>,
+    pub wire: Wire,
+    pub unit: Unit,
+    pub source: Source,
+    value: Mutex<Cell<Option<i32>>>,
+}
+
+impl core::fmt::Debug for GaugeData {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}(0x{:03X}) = {:?}{}", self.name, self.id, self.get(), self.unit.symbol)
+    }
+}
+
+/// Two gauges are equal only if they are the same table entry.
+impl PartialEq for GaugeData {
+    fn eq(&self, other: &Self) -> bool {
+        core::ptr::eq(self, other)
+    }
+}
+impl Eq for GaugeData {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameError {
+    /// The payload length does not match the gauge's wire width.
+    BadLength { expected: usize, got: usize },
 }
 
 impl GaugeData {
-    pub const fn new(id: u16, width: DataWidth, initial_value: u32) -> Self {
+    pub const fn new(name: &'static str, id: u16, wire: Wire, unit: Unit, source: Source) -> Self {
         GaugeData {
+            name,
             id,
-            width,
-            value: Mutex::new(Cell::new(initial_value)),
+            wire,
+            unit,
+            source,
+            value: Mutex::new(Cell::new(None)),
         }
     }
 
-    pub fn width(&self) -> usize {
-        self.width.num_bytes()
+    /// Fixed-point value, or `None` if nothing has written this gauge yet.
+    pub fn get(&self) -> Option<i32> {
+        critical_section::with(|cs| self.value.borrow(cs).get())
     }
 
+    pub fn get_or(&self, default: i32) -> i32 {
+        self.get().unwrap_or(default)
+    }
+
+    /// Value in physical units (counts divided by `unit.scale`).
+    pub fn as_f32(&self) -> Option<f32> {
+        self.reading().map(|r| r.value())
+    }
+
+    /// Value with its unit attached, for conversion: `MAP.reading()?.psi()`.
+    pub fn reading(&self) -> Option<Reading> {
+        self.get().map(|counts| Reading { counts, unit: self.unit })
+    }
+
+    /// Value converted to `target`: `MAP.to(Unit::PSI)`.
+    /// `None` if unset or if `target` is a different physical dimension.
+    pub fn to(&self, target: Unit) -> Option<f32> {
+        self.reading()?.to(target)
+    }
+
+    pub fn set(&self, value: i32) {
+        critical_section::with(|cs| self.value.borrow(cs).set(Some(value)));
+    }
+
+    pub fn clear(&self) {
+        critical_section::with(|cs| self.value.borrow(cs).set(None));
+    }
+
+    pub fn is_set(&self) -> bool {
+        self.get().is_some()
+    }
+
+    /// Frame carrying this gauge, or `None` if it has never been set.
     pub fn to_frame(&self) -> Option<CanFrame> {
-        let data = &self.get().to_le_bytes()[..self.width()];
-        CanFrame::new(Id::Standard(StandardId::new(self.id.into())?), data)
+        let value = self.get()?;
+        let mut buf = [0u8; 4];
+        let n = self.wire.encode(value, &mut buf);
+        CanFrame::new(Id::Standard(StandardId::new(self.id)?), &buf[..n])
     }
 
-    pub fn get(&self) -> u32 {
-        critical_section::with(|cs| {
-            let cell = self.value.borrow(cs).get();
-            cell
-        })
-    }
-
-    pub fn set(&self, value: u32) {
-        critical_section::with(|cs| {
-            self.value.borrow(cs).set(value);
-        })
-    }
-
-
-    pub fn set_from_bytes(&self, data: &[u8]) {
-        let mut bytes = [0; 4];
-        bytes[0..data.len()].copy_from_slice(data);
-
-        self.set(u32::from_le_bytes(bytes));
-    }
-
-    pub fn set_from_frame(&self, frame: CanFrame) {
+    /// Store the payload of a frame addressed to this gauge.
+    pub fn set_from_frame(&self, frame: &CanFrame) -> Result<i32, FrameError> {
         let data = &frame.data()[..frame.dlc()];
-
-        self.set_from_bytes(&data);
-    }
-    pub fn prim_id(&self) -> u8 {
-        let result = self.id.try_into().unwrap();
-        result
+        let value = self.wire.decode(data).ok_or(FrameError::BadLength {
+            expected: self.wire.len(),
+            got: data.len(),
+        })?;
+        self.set(value);
+        Ok(value)
     }
 }
 
+/// Generates, from one row per gauge: the `static` for each gauge, the
+/// `Gauge` enum with matching discriminants, ID lookup, and `ALL_GAUGES`.
 macro_rules! gauges {
-    ($($name:expr, $id:expr, $w:expr),+) => {
+    ($($name:ident = $id:literal : $wire:ident, $unit:ident, $source:ident;)+) => {
         $(
-        paste! {
-            pub static $name: GaugeData = GaugeData::new($id, $w, 0);
-        }
+            pub static $name: GaugeData =
+                GaugeData::new(stringify!($name), $id, Wire::$wire, Unit::$unit, Source::$source);
+            // The client request protocol carries gauge IDs as single bytes.
+            const _: () = assert!($id <= 0xFF, "gauge ID must fit in one request byte");
         )+
+
+        /// Every gauge in table order.
+        pub static ALL_GAUGES: &[&'static GaugeData] = &[$(&$name),+];
+
+        paste! {
+            #[repr(u16)]
+            #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+            pub enum Gauge {
+                $([<$name:camel>] = $id,)+
+            }
+
+            impl Gauge {
+                pub const fn data(self) -> &'static GaugeData {
+                    match self {
+                        $(Gauge::[<$name:camel>] => &$name,)+
+                    }
+                }
+
+                pub const fn id(self) -> u16 {
+                    self as u16
+                }
+
+                pub const fn from_id(id: u16) -> Option<Gauge> {
+                    match id {
+                        $($id => Some(Gauge::[<$name:camel>]),)+
+                        _ => None,
+                    }
+                }
+            }
+        }
     };
 }
 
-#[repr(u16)]
-#[derive(Debug, FromRepr)]
-pub enum Gauge {
-    StaTime = 0x20,
-    StaStatus1 = 0x21,
-    StaEng = 0x22,
-    DWELL = 0x23,
-    MAP = 0x24,
-    IAT = 0x25,
-    CLNT = 0x26,
-    BatCorrect = 0x27,
-    BatVol = 0x28,
-    AfrPri = 0x29,
-    EgoCorrect = 0x2A,
-    IatCorrect = 0x2B,
-    WueCorrect = 0x2C,
-    RPM = 0x2D,
-    AccelEnrich = 0x2E,
-    GammeE = 0x2F,
-    VE = 0x30,
-    AfrTarget = 0x31,
-    PulseWidth1 = 0x32,
-    TpsDot = 0x33,
-    CurSparkAdvance = 0x34,
-    TPS = 0x35,
-    LoopPs = 0x36,
-    FreeMem = 0x37,
-    BoostTarget = 0x38,
-    BoostPwm = 0x39,
-    StaSpark = 0x3A,
-    RpmDot = 0x3B,
-    EthanolPercent = 0x3C,
-    FlexCorrect = 0x3D,
-    FlexIgnCorrect = 0x3E,
-    IdleLoad = 0x3F,
-    TestOutputs = 0x40,
-    AfrSec = 0x41,
-    BARO = 0x42,
-    TpsAdc = 0x43,
-    NextError = 0x44,
-    StaLaunchCorrect = 0x45,
-    PulseWidth2 = 0x46,
-    PulseWidth3 = 0x47,
-    PulseWidth4 = 0x48,
-    StaStatus2 = 0x49,
-    EngProtectSta = 0x4A,
-    FuelLoad = 0x4B,
-    IgnLoad = 0x4C,
-    InjAngle = 0x4D,
-    IdleDuty = 0x4E,
-    ClIdleTarget = 0x4F,
-    MapDot = 0x50,
-    VvtAngle = 0x51,
-    VvtTargetAngle = 0x52,
-    VvtDuty = 0x53,
-    FlexBoostCorrect = 0x54,
-    BaroCorrection = 0x55,
-    ASE = 0x56,
-    VSS = 0x57,
-    GEAR = 0x58,
-    FuelPres = 0x59,
-    OilPres = 0x5A,
-    WmiPw = 0x5B,
-    StaStatus4 = 0x5C,
-    VvtAngle2 = 0x5D,
-    VvtTargetAngle2 = 0x5E,
-    VvtDuty2 = 0x5F,
-    StatusOutSta = 0x60,
-    FlexFuelTemp = 0x61,
-    FuelTempCorrect = 0x62,
-    VE1 = 0x63,
-    VE2 = 0x64,
-    ADVANCE1 = 0x66,
-    ADVANCE2 = 0x67,
-    NitroSta = 0x68,
-    SdSta = 0x69,
-    Masteralive = 0x70
+/// Look up a gauge by its CAN ID.
+pub fn gauge_by_id(id: u16) -> Option<&'static GaugeData> {
+    Gauge::from_id(id).map(Gauge::data)
 }
 
-impl Gauge {
-    fn raw_gauge(&self) -> &'static GaugeData {
-        match self {
-            Gauge::StaTime => &STA_TIME,
-            Gauge::StaStatus1 => &STA_STATUS1,
-            Gauge::StaEng => &STA_ENG,
-            Gauge::DWELL => &DWELL,
-            Gauge::MAP => &MAP,
-            Gauge::IAT => &IAT,
-            Gauge::CLNT => &CLNT,
-            Gauge::BatCorrect => &BAT_CORRECT,
-            Gauge::BatVol => &BAT_VOL,
-            Gauge::AfrPri => &AFR_PRI,
-            Gauge::EgoCorrect => &EGO_CORRECT,
-            Gauge::IatCorrect => &IAT_CORRECT,
-            Gauge::WueCorrect => &WUE_CORRECT,
-            Gauge::RPM => &RPM,
-            Gauge::AccelEnrich => &ACCEL_ENRICH,
-            Gauge::GammeE => &GAMME_E,
-            Gauge::VE => &VE,
-            Gauge::AfrTarget => &AFR_TARGET,
-            Gauge::PulseWidth1 => &PULSE_WIDTH1,
-            Gauge::TpsDot => &TPS_DOT,
-            Gauge::CurSparkAdvance => &CUR_SPARK_ADVANCE,
-            Gauge::TPS => &TPS,
-            Gauge::LoopPs => &LOOP_PS,
-            Gauge::FreeMem => &FREE_MEM,
-            Gauge::BoostTarget => &BOOST_TARGET,
-            Gauge::BoostPwm => &BOOST_PWM,
-            Gauge::StaSpark => &STA_SPARK,
-            Gauge::RpmDot => &RPM_DOT,
-            Gauge::EthanolPercent => &ETHANOL_PERCENT,
-            Gauge::FlexCorrect => &FLEX_CORRECT,
-            Gauge::FlexIgnCorrect => &FLEX_IGN_CORRECT,
-            Gauge::IdleLoad => &IDLE_LOAD,
-            Gauge::TestOutputs => &TEST_OUTPUTS,
-            Gauge::AfrSec => &AFR_SEC,
-            Gauge::BARO => &BARO,
-            Gauge::TpsAdc => &TPS_ADC,
-            Gauge::NextError => &NEXT_ERROR,
-            Gauge::StaLaunchCorrect => &STA_LAUNCH_CORRECT,
-            Gauge::PulseWidth2 => &PULSE_WIDTH2,
-            Gauge::PulseWidth3 => &PULSE_WIDTH3,
-            Gauge::PulseWidth4 => &PULSE_WIDTH4,
-            Gauge::StaStatus2 => &STA_STATUS2,
-            Gauge::EngProtectSta => &ENG_PROTECT_STA,
-            Gauge::FuelLoad => &FUEL_LOAD,
-            Gauge::IgnLoad => &IGN_LOAD,
-            Gauge::InjAngle => &INJ_ANGLE,
-            Gauge::IdleDuty => &IDLE_DUTY,
-            Gauge::ClIdleTarget => &CL_IDLE_TARGET,
-            Gauge::MapDot => &MAP_DOT,
-            Gauge::VvtAngle => &VVT_ANGLE,
-            Gauge::VvtTargetAngle => &VVT_TARGET_ANGLE,
-            Gauge::VvtDuty => &VVT_DUTY,
-            Gauge::FlexBoostCorrect => &FLEX_BOOST_CORRECT,
-            Gauge::BaroCorrection => &BARO_CORRECTION,
-            Gauge::ASE => &ASE,
-            Gauge::VSS => &VSS,
-            Gauge::GEAR => &GEAR,
-            Gauge::FuelPres => &FUEL_PRES,
-            Gauge::OilPres => &OIL_PRES,
-            Gauge::WmiPw => &WMI_PW,
-            Gauge::StaStatus4 => &STA_STATUS4,
-            Gauge::VvtAngle2 => &VVT_ANGLE2,
-            Gauge::VvtTargetAngle2 => &VVT_TARGET_ANGLE2,
-            Gauge::VvtDuty2 => &VVT_DUTY2,
-            Gauge::StatusOutSta => &STATUS_OUT_STA,
-            Gauge::FlexFuelTemp => &FLEX_FUEL_TEMP,
-            Gauge::FuelTempCorrect => &FUEL_TEMP_CORRECT,
-            Gauge::VE1 => &VE1,
-            Gauge::VE2 => &VE2,
-            Gauge::ADVANCE1 => &ADVANCE1,
-            Gauge::ADVANCE2 => &ADVANCE2,
-            Gauge::NitroSta => &NITRO_STA,
-            Gauge::SdSta => &SD_STA,
-            Gauge::Masteralive => &MASTERALIVE,
-        }
-    }
-}
-
-impl Deref for Gauge {
-    type Target = GaugeData;
-
-    fn deref(&self) -> &'static Self::Target {
-        self.raw_gauge()
-    }
-}
-
+// CAN ID map. 0x000..=0x01F is reserved for protocol frames (see `protocol`).
+// Lower IDs win bus arbitration, so more urgent gauges belong at lower IDs.
 gauges! {
-    STA_TIME, 0x20, DataWidth::U8,
-    STA_STATUS1, 0x21, DataWidth::U8,
-    STA_ENG, 0x22, DataWidth::U8,
-    DWELL, 0x23, DataWidth::U8,
-    MAP, 0x24, DataWidth::U16,
-    IAT, 0x25, DataWidth::U8,
-    CLNT, 0x26, DataWidth::U8,
-    BAT_CORRECT, 0x27, DataWidth::U8,
-    BAT_VOL, 0x28, DataWidth::U8,
-    AFR_PRI, 0x29, DataWidth::U8,
-    EGO_CORRECT, 0x2A, DataWidth::U8,
-    IAT_CORRECT, 0x2B, DataWidth::U8,
-    WUE_CORRECT, 0x2C, DataWidth::U8,
-    RPM, 0x2D, DataWidth::U16,
-    ACCEL_ENRICH, 0x2E, DataWidth::U8,
-    GAMME_E, 0x2F, DataWidth::U8,
-    VE, 0x30, DataWidth::U8,
-    AFR_TARGET, 0x31, DataWidth::U8,
-    PULSE_WIDTH1, 0x32, DataWidth::U16,
-    TPS_DOT, 0x33, DataWidth::U8,
-    CUR_SPARK_ADVANCE, 0x34, DataWidth::U8,
-    TPS, 0x35, DataWidth::U8,
-    LOOP_PS, 0x36, DataWidth::U16,
-    FREE_MEM, 0x37, DataWidth::U16,
-    BOOST_TARGET, 0x38, DataWidth::U8,
-    BOOST_PWM, 0x39, DataWidth::U8,
-    STA_SPARK, 0x3A, DataWidth::U8,
-    RPM_DOT, 0x3B, DataWidth::I16,
-    ETHANOL_PERCENT, 0x3C, DataWidth::U8,
-    FLEX_CORRECT, 0x3D, DataWidth::U8,
-    FLEX_IGN_CORRECT, 0x3E, DataWidth::U8,
-    IDLE_LOAD, 0x3F, DataWidth::U8,
-    TEST_OUTPUTS, 0x40, DataWidth::U8,
-    AFR_SEC, 0x41, DataWidth::U8,
-    BARO, 0x42, DataWidth::U8,
-    TPS_ADC, 0x43, DataWidth::U8,
-    NEXT_ERROR, 0x44, DataWidth::U8,
-    STA_LAUNCH_CORRECT, 0x45, DataWidth::U8,
-    PULSE_WIDTH2, 0x46, DataWidth::U8,
-    PULSE_WIDTH3, 0x47, DataWidth::U8,
-    PULSE_WIDTH4, 0x48, DataWidth::U8,
-    STA_STATUS2, 0x49, DataWidth::U8,
-    ENG_PROTECT_STA, 0x4A, DataWidth::U8,
-    FUEL_LOAD, 0x4B, DataWidth::U16,
-    IGN_LOAD, 0x4C, DataWidth::U16,
-    INJ_ANGLE, 0x4D, DataWidth::U16,
-    IDLE_DUTY, 0x4E, DataWidth::U8,
-    CL_IDLE_TARGET, 0x4F, DataWidth::U8,
-    MAP_DOT, 0x50, DataWidth::U8,
-    VVT_ANGLE, 0x51, DataWidth::U8,
-    VVT_TARGET_ANGLE, 0x52, DataWidth::U8,
-    VVT_DUTY, 0x53, DataWidth::U8,
-    FLEX_BOOST_CORRECT, 0x54, DataWidth::U16,
-    BARO_CORRECTION, 0x55, DataWidth::U8,
-    ASE, 0x56, DataWidth::U8,
-    VSS, 0x57, DataWidth::U16,
-    GEAR, 0x58, DataWidth::U8,
-    FUEL_PRES, 0x59, DataWidth::U8,
-    OIL_PRES, 0x5A, DataWidth::U8,
-    WMI_PW, 0x5B, DataWidth::U8,
-    STA_STATUS4, 0x5C, DataWidth::U8,
-    VVT_ANGLE2, 0x5D, DataWidth::U8,
-    VVT_TARGET_ANGLE2, 0x5E, DataWidth::U8,
-    VVT_DUTY2, 0x5F, DataWidth::U8,
-    STATUS_OUT_STA, 0x60, DataWidth::U8,
-    FLEX_FUEL_TEMP, 0x61, DataWidth::U8,
-    FUEL_TEMP_CORRECT, 0x62, DataWidth::U8,
-    VE1, 0x63, DataWidth::U8,
-    VE2, 0x64, DataWidth::U8,
-    ADVANCE1, 0x66, DataWidth::U8,
-    ADVANCE2, 0x67, DataWidth::U8,
-    NITRO_STA, 0x68, DataWidth::U8,
-    SD_STA, 0x69, DataWidth::U8,
-    MASTERALIVE, 0x70, DataWidth::U8
+    STA_TIME            = 0x20: U8,  SECONDS,       Common;
+    STA_STATUS1         = 0x21: U8,  RAW,           Speeduino;
+    STA_ENG             = 0x22: U8,  RAW,           Speeduino;
+    DWELL               = 0x23: U16, MS,            Standalone;
+    MAP                 = 0x24: U16, KPA,           Common;
+    IAT                 = 0x25: I16, CELSIUS,       Common;
+    CLNT                = 0x26: I16, CELSIUS,       Common;
+    BAT_CORRECT         = 0x27: U16, PERCENT,       Speeduino;
+    BAT_VOL             = 0x28: U16, VOLT,          Common;
+    AFR_PRI             = 0x29: U16, AFR,           Common;
+    // Closed-loop fuel trim, 0 = no correction (Speeduino's 100-centred value is shifted).
+    EGO_CORRECT         = 0x2A: I16, PERCENT,       Common;
+    IAT_CORRECT         = 0x2B: U16, PERCENT,       Speeduino;
+    WUE_CORRECT         = 0x2C: U16, PERCENT,       Speeduino;
+    RPM                 = 0x2D: U16, RPM,           Common;
+    ACCEL_ENRICH        = 0x2E: U16, PERCENT,       Speeduino;
+    GAMME_E             = 0x2F: U16, PERCENT,       Speeduino;
+    VE                  = 0x30: U16, PERCENT,       Standalone;
+    AFR_TARGET          = 0x31: U16, AFR,           Common;
+    PULSE_WIDTH1        = 0x32: U16, MS,            Standalone;
+    TPS_DOT             = 0x33: I16, PERCENT_PER_S, Standalone;
+    CUR_SPARK_ADVANCE   = 0x34: I16, DEGREES,       Common;
+    TPS                 = 0x35: U16, PERCENT,       Common;
+    LOOP_PS             = 0x36: U16, HZ,            Speeduino;
+    FREE_MEM            = 0x37: U16, BYTES,         Speeduino;
+    BOOST_TARGET        = 0x38: U16, KPA,           Standalone;
+    BOOST_PWM           = 0x39: U16, PERCENT,       Standalone;
+    STA_SPARK           = 0x3A: U8,  RAW,           Speeduino;
+    RPM_DOT             = 0x3B: I16, RPM_PER_S,     Standalone;
+    ETHANOL_PERCENT     = 0x3C: U16, PERCENT,       Common;
+    FLEX_CORRECT        = 0x3D: U16, PERCENT,       Speeduino;
+    FLEX_IGN_CORRECT    = 0x3E: I16, DEGREES,       Speeduino;
+    IDLE_LOAD           = 0x3F: U8,  RAW,           Standalone;
+    TEST_OUTPUTS        = 0x40: U8,  RAW,           Speeduino;
+    AFR_SEC             = 0x41: U16, AFR,           Standalone;
+    BARO                = 0x42: U16, KPA,           Common;
+    TPS_ADC             = 0x43: U8,  RAW,           Speeduino;
+    NEXT_ERROR          = 0x44: U8,  RAW,           Common;
+    STA_LAUNCH_CORRECT  = 0x45: U16, PERCENT,       Standalone;
+    PULSE_WIDTH2        = 0x46: U16, MS,            Standalone;
+    PULSE_WIDTH3        = 0x47: U16, MS,            Standalone;
+    PULSE_WIDTH4        = 0x48: U16, MS,            Standalone;
+    STA_STATUS2         = 0x49: U8,  RAW,           Speeduino;
+    ENG_PROTECT_STA     = 0x4A: U8,  RAW,           Speeduino;
+    FUEL_LOAD           = 0x4B: I16, RAW,           Common;
+    IGN_LOAD            = 0x4C: I16, RAW,           Common;
+    INJ_ANGLE           = 0x4D: U16, DEGREES,       Standalone;
+    IDLE_DUTY           = 0x4E: U16, PERCENT,       Standalone;
+    CL_IDLE_TARGET      = 0x4F: U16, RPM,           Standalone;
+    MAP_DOT             = 0x50: I16, KPA_PER_S,     Standalone;
+    VVT_ANGLE           = 0x51: I16, DEGREES,       Standalone;
+    VVT_TARGET_ANGLE    = 0x52: U16, DEGREES,       Standalone;
+    VVT_DUTY            = 0x53: U16, PERCENT,       Standalone;
+    FLEX_BOOST_CORRECT  = 0x54: I16, KPA,           Speeduino;
+    BARO_CORRECTION     = 0x55: U16, PERCENT,       Speeduino;
+    ASE                 = 0x56: U16, PERCENT,       Speeduino;
+    VSS                 = 0x57: U16, KMH,           Common;
+    GEAR                = 0x58: U8,  RAW,           Common;
+    FUEL_PRES           = 0x59: U16, KPA,           Common;
+    OIL_PRES            = 0x5A: U16, KPA,           Standalone;
+    WMI_PW              = 0x5B: U16, PERCENT,       Standalone;
+    STA_STATUS4         = 0x5C: U8,  RAW,           Speeduino;
+    VVT_ANGLE2          = 0x5D: I16, DEGREES,       Standalone;
+    VVT_TARGET_ANGLE2   = 0x5E: U16, DEGREES,       Standalone;
+    VVT_DUTY2           = 0x5F: U16, PERCENT,       Standalone;
+    STATUS_OUT_STA      = 0x60: U8,  RAW,           Speeduino;
+    FLEX_FUEL_TEMP      = 0x61: I16, CELSIUS,       Standalone;
+    FUEL_TEMP_CORRECT   = 0x62: U16, PERCENT,       Speeduino;
+    VE1                 = 0x63: U16, PERCENT,       Standalone;
+    VE2                 = 0x64: U16, PERCENT,       Standalone;
+    ADVANCE1            = 0x66: I16, DEGREES,       Standalone;
+    ADVANCE2            = 0x67: I16, DEGREES,       Standalone;
+    NITRO_STA           = 0x68: U8,  RAW,           Speeduino;
+    SD_STA              = 0x69: U8,  RAW,           Speeduino;
+    MASTERALIVE         = 0x70: U8,  RAW,           Protocol;
+    // Common channels other ECUs broadcast that Speeduino does not.
+    OIL_TEMP            = 0x71: I16, CELSIUS,       Common;
+    EGT1                = 0x72: I16, CELSIUS,       Common;
+    FUEL_LEVEL          = 0x73: U16, PERCENT,       Common;
+    COOLANT_PRES        = 0x74: U16, KPA,           Standalone;
+    PEDAL               = 0x75: U16, PERCENT,       Common;
+    TRANS_TEMP          = 0x76: I16, CELSIUS,       Standalone;
+    INJ_DUTY            = 0x77: U16, PERCENT,       Standalone;
+    WASTEGATE_PRES      = 0x78: U16, KPA,           Standalone;
+    ERROR_COUNT         = 0x79: U16, RAW,           Common;
+    // Fuel remaining in litres; FUEL_LEVEL is the percent form.
+    FUEL_VOLUME         = 0x7A: U16, LITRES,        Standalone;
 }
