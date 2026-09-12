@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! OBD2 mode 01 request/response.
 
 use cogware_can::obd2::*;

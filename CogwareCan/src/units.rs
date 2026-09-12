@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! Units and conversions.
 //!
 //! Every gauge stores fixed-point counts in one canonical `Unit`. A `Reading`

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! Table-driven decoding shared by every ECU converter.
 //!
 //! Adding a data source means writing tables, not code:

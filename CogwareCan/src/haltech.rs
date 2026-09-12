@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! Haltech CAN Broadcast Protocol converter (Elite and Nexus, protocol V2.35).
 //!
 //! Every channel is a big-endian 16-bit word at a fixed 11-bit ID (the base is

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! Adding a new ECU: write tables, not code.
 //!
 //! This is the whole job for any CAN-broadcast ECU. Copy this file, put the

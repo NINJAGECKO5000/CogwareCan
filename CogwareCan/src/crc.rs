@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! IEEE 802.3 CRC-32 (reflected, polynomial 0xEDB88320), bitwise so it costs
 //! no table space on the microcontroller. Used by `xfer` to verify images.
 

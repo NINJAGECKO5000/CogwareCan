@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! CogwareCan: one crate holding the gauge spec, the ECU converters, and the
 //! CAN framing, so a server or display only ever talks to this crate.
 //!

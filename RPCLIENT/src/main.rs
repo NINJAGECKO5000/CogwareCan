@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! CogwareCan display: subscribes to the gauges it shows, renders them in
 //! whatever units it likes, and listens for over-the-air updates.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! rusEFI CAN broadcast converter ("rusEFI verbose" dash output).
 //!
 //! Layout verified against `firmware/controllers/can/can_verbose.cpp` and

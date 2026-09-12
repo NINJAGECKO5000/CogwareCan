@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! Gauge subscriptions: what displays ask for and what the master sends back.
 
 use cogware_can::subscribe::*;

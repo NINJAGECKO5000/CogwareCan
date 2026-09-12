@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! OBD2 (ISO 15765-4 / SAE J1979) mode 01 converter.
 //!
 //! OBD2 is request/response, not broadcast: the master sends `request(pid)`

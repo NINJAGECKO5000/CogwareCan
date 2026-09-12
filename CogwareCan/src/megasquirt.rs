@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! Megasquirt "Simplified Dash Broadcasting" converter (MS2/Extra 3.4.x and
 //! MS3 1.4.x, document dated 2016-02-17).
 //!

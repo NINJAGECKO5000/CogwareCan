@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! CAN-broadcast ECU converters. These prove each table decodes what it
 //! declares; the declared layouts were checked against vendor documents and
 //! firmware source (see each module header).

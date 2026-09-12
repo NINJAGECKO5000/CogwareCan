@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! The display bus end to end: a client subscribes, the server broadcasts,
 //! the client renders. This is what RPSERVER and RPCLIENT do in firmware.
 //!

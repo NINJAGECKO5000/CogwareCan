@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! CAN-broadcast ECUs in: the same gauges, whatever is attached.
 //!
 //!     cargo run --example ecu_can

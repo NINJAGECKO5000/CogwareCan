@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! ECUMaster EMU Black CAN stream converter (manual 1.4, firmware 2.169+).
 //!
 //! Eight little-endian frames at a configurable base, 0x600 by default,

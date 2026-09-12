@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! CogwareCan master: a Speeduino on UART becomes gauge frames on the CAN bus.
 //!
 //! Core 0 polls the ECU and fills the gauge table. Core 1 owns the CAN

@@ -1,3 +1,9 @@
 WIP CogwareCan Definitions with basic client / server setup
 Alongside CogwareCopilot
 
+
+## License
+
+GPL-3.0-only. A commercial license is available for firmware you cannot ship
+under the GPL; LICENSING.md explains both and how to ask. Sending a patch
+accepts the contributor agreement in CONTRIBUTING.md.

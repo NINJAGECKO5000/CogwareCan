@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! The gauge specification: every value the displays can show, its CAN ID,
 //! its canonical unit, and how it travels on the wire.
 //!

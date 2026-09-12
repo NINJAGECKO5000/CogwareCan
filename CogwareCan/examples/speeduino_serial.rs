@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! Serial ECU in: a Speeduino realtime packet becomes gauge values.
 //!
 //!     cargo run --example speeduino_serial

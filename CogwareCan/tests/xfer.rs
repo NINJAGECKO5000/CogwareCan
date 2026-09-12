@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! Master-to-node file transfer, driven frame by frame with a lossy "bus".
 
 use cogware_can::protocol::NODE_BROADCAST;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! MaxxECU default CAN output converter (protocol V1.3, 2020-09-29).
 //!
 //! Every channel is a little-endian `int16` at a fixed 11-bit ID, 500 kbit/s.

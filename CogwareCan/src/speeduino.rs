@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! Speeduino serial converter: turns a realtime-data packet from the ECU's
 //! TunerStudio serial protocol into canonical gauge values.
 //!

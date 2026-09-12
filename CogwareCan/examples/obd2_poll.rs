@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! OBD2 in: the one source that is request/response rather than broadcast.
 //!
 //!     cargo run --example obd2_poll

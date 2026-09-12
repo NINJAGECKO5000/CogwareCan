@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! The gauge spec: reading values, units, and what "unset" means.
 //!
 //!     cargo run --example gauges

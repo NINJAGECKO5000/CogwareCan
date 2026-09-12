@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! Which gauges each display wants, and how it asks for them.
 //!
 //! Both halves are pure state machines over CAN frames. They touch no driver,

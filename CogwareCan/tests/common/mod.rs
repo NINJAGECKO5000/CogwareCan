@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! Shared setup for the integration tests.
 //!
 //! The gauge table is a set of process-wide statics, so every test in a

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! Speeduino serial packet -> canonical gauges.
 
 use cogware_can::speeduino::*;

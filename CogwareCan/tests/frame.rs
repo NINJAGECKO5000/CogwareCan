@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! CAN framing and spec-table consistency.
 
 use cogware_can::*;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-only
 //! Over-the-air update: the master pushes an image to every node on the bus.
 //!
 //!     cargo run --example ota_update
