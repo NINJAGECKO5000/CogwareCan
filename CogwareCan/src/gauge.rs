@@ -85,6 +85,9 @@ pub enum Source {
     Speeduino,
     /// Bus housekeeping, produced by the server itself.
     Protocol,
+    /// Needs a GPS receiver wired to the server. No ECU supplies it, so this
+    /// sits outside the ladder above rather than further along it.
+    Gps,
 }
 
 pub struct GaugeData {
@@ -310,6 +313,9 @@ gauges! {
     ADVANCE2            = 0x67: I16, DEGREES,       Standalone;
     NITRO_STA           = 0x68: U8,  RAW,           Speeduino;
     SD_STA              = 0x69: U8,  RAW,           Speeduino;
+    // Dashboard tell-tales, one bit each; see `indicators` for the bit names.
+    INDICATORS1         = 0x6A: I32, RAW,           Protocol;
+    INDICATORS2         = 0x6B: I32, RAW,           Protocol;
     MASTERALIVE         = 0x70: U8,  RAW,           Protocol;
     // Common channels other ECUs broadcast that Speeduino does not.
     OIL_TEMP            = 0x71: I16, CELSIUS,       Common;
@@ -323,4 +329,14 @@ gauges! {
     ERROR_COUNT         = 0x79: U16, RAW,           Common;
     // Fuel remaining in litres; FUEL_LEVEL is the percent form.
     FUEL_VOLUME         = 0x7A: U16, LITRES,        Standalone;
+    // Distance travelled. OBD2 PID 0xA6 supplies it on MY2019 and later cars;
+    // anything older needs a trip counter kept by whatever feeds the bus.
+    ODOMETER            = 0x7B: I32, KILOMETRES,    Common;
+    // 0 no fix, 1 2D, 2 3D, 3 differential or better. Zero is the only value
+    // that means "do not trust the other GPS gauges".
+    GPS_LOCK            = 0x7C: U8,  RAW,           Gps;
+    GPS_SATS            = 0x7D: U8,  RAW,           Gps;
+    // Speed over ground, which is not VSS: it survives a wheel-speed fault
+    // and disagrees with it under wheelspin.
+    GPS_SPEED           = 0x7E: U16, KMH,           Gps;
 }

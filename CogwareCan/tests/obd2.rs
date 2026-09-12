@@ -8,6 +8,10 @@ use embedded_hal_0_2::can::Frame;
 mod common;
 use common::bus;
 
+fn close(a: Option<f32>, b: f32) -> bool {
+    a.is_some_and(|a| (a - b).abs() < 1.0)
+}
+
 fn response(pid: u8, data: &[u8]) -> mcp2515::frame::CanFrame {
     let mut d = vec![2 + data.len() as u8, 0x41, pid];
     d.extend_from_slice(data);
@@ -82,4 +86,35 @@ fn pids_are_unique_and_only_feed_common_gauges() {
             assert_eq!(f.gauge.source, Source::Common, "PID {:#x} feeds {}", p.pid, f.gauge.name);
         }
     }
+}
+
+#[test]
+fn odometer_decodes_from_pid_a6() {
+    let _bus = bus();
+    // PID A6 is 0.1 km/bit, which is exactly what an ODOMETER count is, so
+    // the raw big-endian u32 lands in the gauge untouched.
+    assert_eq!(feed_response(&response(0xA6, &[0x00, 0x12, 0xD6, 0x87])), Some(1));
+    assert_eq!(ODOMETER.get(), Some(1_234_567));
+    assert_eq!(ODOMETER.as_f32(), Some(123_456.7));
+    assert!(close(ODOMETER.to(Unit::MILES), 76_712.4));
+
+    // A fresh car reads zero, which must be distinguishable from unset.
+    feed_response(&response(0xA6, &[0, 0, 0, 0]));
+    assert_eq!(ODOMETER.get(), Some(0));
+    assert!(ODOMETER.is_set());
+}
+
+#[test]
+fn odometer_survives_a_million_kilometre_reading() {
+    let _bus = bus();
+    // A working truck outlives i32 tenths-of-a-kilometre only past 214
+    // million km, so the wire width is not the limit in any real vehicle.
+    feed_response(&response(0xA6, &[0x00, 0x98, 0x96, 0x80])); // 10_000_000
+    assert_eq!(ODOMETER.as_f32(), Some(1_000_000.0));
+
+    let f = frame_for(Gauge::Odometer.id()).unwrap();
+    assert_eq!(f.dlc(), 4, "an odometer needs the full 32 bits");
+    ODOMETER.clear();
+    feed_frame(&f).unwrap();
+    assert_eq!(ODOMETER.as_f32(), Some(1_000_000.0));
 }

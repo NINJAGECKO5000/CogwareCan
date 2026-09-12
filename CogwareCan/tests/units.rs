@@ -92,3 +92,26 @@ fn unit_convert_is_symmetric() {
         assert!((back - v).abs() < 0.001, "{} -> {} -> back", a.symbol, b.symbol);
     }
 }
+
+#[test]
+fn distance_conversions() {
+    let _bus = bus();
+    ODOMETER.set(1_234_567); // 123456.7 km
+    let r = ODOMETER.reading().unwrap();
+    assert!(close(r.kilometres(), 123_456.7));
+    assert!(close(r.miles(), 76_712.44));
+    // A distance is not a speed, however alike the units read.
+    assert_eq!(r.kmh(), None);
+    assert_eq!(r.mph(), None);
+    assert_eq!(r.litres(), None);
+}
+
+#[test]
+fn gps_speed_converts_like_any_other_speed() {
+    let _bus = bus();
+    GPS_SPEED.set(880); // 88.0 km/h
+    assert!(close(GPS_SPEED.to(Unit::MPH), 54.68));
+    assert_eq!(GPS_SPEED.unit, VSS.unit, "so a scene can swap one for the other");
+    // Distance is a different dimension, so it does not convert.
+    assert_eq!(GPS_SPEED.to(Unit::KILOMETRES), None);
+}

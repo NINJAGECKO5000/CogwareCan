@@ -3,6 +3,7 @@
 
 use cogware_can::protocol::NODE_BROADCAST;
 use cogware_can::xfer::*;
+use embedded_hal_0_2::can::Frame;
 use cogware_can::{crc, protocol};
 use mcp2515::frame::CanFrame;
 
@@ -185,4 +186,40 @@ fn crc_matches_reference() {
     c.update(b"1234");
     c.update(b"56789");
     assert_eq!(c.finish(), 0xCBF4_3926);
+}
+
+#[test]
+fn the_slot_and_kind_reach_the_sink() {
+    let image = [0x5Au8; 40];
+    let mut store = [0u8; 64];
+    let mut tx = Sender::new(2, &image, kind::SCENE, 8, 1).with_slot(3);
+    let mut rx = Receiver::new(2, BufferSink::new(&mut store));
+
+    for _ in 0..64 {
+        if let Some(f) = tx.next_frame() {
+            if let Some(reply) = rx.feed(&f) {
+                tx.feed_reply(&reply);
+            }
+        }
+        if tx.state() == TxState::Done {
+            break;
+        }
+    }
+    assert_eq!(tx.state(), TxState::Done);
+    assert_eq!(rx.image(), Image { size: 40, kind: kind::SCENE, slot: 3 });
+    assert!(rx.sink().committed);
+    assert_eq!(&rx.sink().buf[..40], &image[..]);
+}
+
+#[test]
+fn a_begin_without_a_slot_byte_lands_in_slot_zero() {
+    // Seven-byte Begin frames predate slots; a node must still accept one
+    // rather than refusing the transfer outright.
+    let mut store = [0u8; 16];
+    let mut rx = Receiver::new(1, BufferSink::new(&mut store));
+    let begin = protocol::frame(CMD_ID, &[1, Cmd::Begin as u8, 8, 0, 0, 0, kind::FIRMWARE]).unwrap();
+
+    let reply = rx.feed(&begin).expect("the node answers");
+    assert_eq!(reply.data()[1], Status::Ready as u8);
+    assert_eq!(rx.image(), Image { size: 8, kind: kind::FIRMWARE, slot: 0 });
 }

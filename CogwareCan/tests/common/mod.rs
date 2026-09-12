@@ -14,10 +14,11 @@
 
 #![allow(dead_code)]
 
-use cogware_can::clear_all;
+use cogware_can::{clear_all, config};
 use std::sync::{Mutex, MutexGuard};
 
 static LOCK: Mutex<()> = Mutex::new(());
+static SETTINGS_LOCK: Mutex<()> = Mutex::new(());
 
 /// Exclusive use of the gauge table for as long as this value is alive.
 pub struct Bus(MutexGuard<'static, ()>);
@@ -35,5 +36,22 @@ pub fn bus() -> Bus {
 impl Drop for Bus {
     fn drop(&mut self) {
         clear_all();
+    }
+}
+
+/// Exclusive use of the settings table for as long as this value is alive.
+/// Settings are process-wide statics too, and take the same treatment.
+pub struct Settings(MutexGuard<'static, ()>);
+
+/// Take the settings table, at its defaults.
+pub fn settings() -> Settings {
+    let guard = SETTINGS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    config::reset_all();
+    Settings(guard)
+}
+
+impl Drop for Settings {
+    fn drop(&mut self) {
+        config::reset_all();
     }
 }

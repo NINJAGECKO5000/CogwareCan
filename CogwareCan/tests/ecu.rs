@@ -299,5 +299,50 @@ fn every_common_gauge_has_a_can_source() {
         .filter(|g| g.source == Source::Common && !fed.contains(g.name))
         .map(|g| g.name)
         .collect();
-    assert_eq!(orphans, vec!["STA_TIME", "FUEL_LOAD", "IGN_LOAD"], "Common gauges only Speeduino/OBD2 feed");
+    assert_eq!(
+        orphans,
+        vec!["STA_TIME", "FUEL_LOAD", "IGN_LOAD", "ODOMETER"],
+        "Common gauges only Speeduino/OBD2 feed"
+    );
+}
+
+#[test]
+fn gps_gauges_need_a_receiver_not_an_ecu() {
+    // Classing these Common or Standalone would tell a display that fitting
+    // any ECU is enough to get them, which it is not.
+    for g in [&GPS_LOCK, &GPS_SATS, &GPS_SPEED] {
+        assert_eq!(g.source, Source::Gps, "{}", g.name);
+        assert!(g.source > Source::Standalone, "{} must fail a <= Standalone check", g.name);
+    }
+    // No converter in this crate feeds them, so none may claim to.
+    let fed: std::collections::HashSet<&str> = CAN_SOURCES
+        .iter()
+        .flat_map(|s| s.frames.iter().flat_map(|m| m.fields.iter().map(|f| f.gauge.name)))
+        .collect();
+    for name in ["GPS_LOCK", "GPS_SATS", "GPS_SPEED"] {
+        assert!(!fed.contains(name), "{name} has no CAN-broadcast source");
+    }
+}
+
+#[test]
+fn no_gps_lock_is_the_only_value_meaning_do_not_trust_the_rest() {
+    let _bus = bus();
+    // Unset and zero are different: nothing has said anything yet, versus a
+    // receiver that is powered and reporting no fix.
+    assert!(!GPS_LOCK.is_set());
+    GPS_LOCK.set(0);
+    assert_eq!(GPS_LOCK.get(), Some(0));
+    assert!(GPS_LOCK.is_set());
+
+    GPS_SATS.set(11);
+    GPS_LOCK.set(3);
+    assert_eq!((GPS_LOCK.get(), GPS_SATS.get()), (Some(3), Some(11)));
+
+    // Both are single bytes, so a satellite count cannot run past 255.
+    GPS_SATS.set(9999);
+    let f = frame_for(Gauge::GpsSats.id()).unwrap();
+    assert_eq!(f.dlc(), 1);
+    GPS_SATS.clear();
+    feed_frame(&f).unwrap();
+    assert_eq!(GPS_SATS.get(), Some(255), "clamped, never wrapped to nothing");
 }

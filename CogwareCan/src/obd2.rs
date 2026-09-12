@@ -81,6 +81,8 @@ static P52: &[Field] = &[field!(0, U8, ETHANOL_PERCENT, pct255)];
 static P5A: &[Field] = &[field!(0, U8, PEDAL, pct255)];
 static P5C: &[Field] = &[field!(0, U8, OIL_TEMP, celsius_plus40)];
 static P78: &[Field] = &[field!(1, U16BE, EGT1, egt)];
+// 0.1 km/bit, which is what an ODOMETER count already is.
+static PA6: &[Field] = &[field!(0, U32BE, ODOMETER, raw)];
 
 /// Every PID this converter decodes, in a sensible polling order.
 pub static PIDS: &[Pid] = &[
@@ -105,6 +107,7 @@ pub static PIDS: &[Pid] = &[
     Pid { pid: 0x78, fields: P78 },
     Pid { pid: 0x1F, fields: P1F },
     Pid { pid: 0x01, fields: P01 },
+    Pid { pid: 0xA6, fields: PA6 },
 ];
 
 /// Mode 01 request for `pid`.

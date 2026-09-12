@@ -34,6 +34,8 @@ pub enum Quantity {
     Angle,
     Duration,
     Speed,
+    /// How far, as on an odometer or a trip meter.
+    Distance,
     Data,
     Volume,
 }
@@ -75,6 +77,7 @@ impl Unit {
     /// Milliseconds stored as microseconds (pulse width, dwell).
     pub const MS: Unit = Unit::base("ms", 1000, Quantity::Duration);
     pub const KMH: Unit = Unit::base("km/h", 10, Quantity::Speed);
+    pub const KILOMETRES: Unit = Unit::base("km", 10, Quantity::Distance);
     pub const BYTES: Unit = Unit::base("B", 1, Quantity::Data);
     pub const LITRES: Unit = Unit::base("L", 10, Quantity::Volume);
 
@@ -85,6 +88,7 @@ impl Unit {
     pub const BAR: Unit = Unit::derived("bar", Quantity::Pressure, 100.0, 0.0);
     pub const INHG: Unit = Unit::derived("inHg", Quantity::Pressure, 3.386_39, 0.0);
     pub const MPH: Unit = Unit::derived("mph", Quantity::Speed, 1.609_344, 0.0);
+    pub const MILES: Unit = Unit::derived("mi", Quantity::Distance, 1.609_344, 0.0);
     pub const LAMBDA: Unit = Unit::derived("λ", Quantity::Mixture, 14.7, 0.0);
     pub const MILLIVOLT: Unit = Unit::derived("mV", Quantity::Voltage, 0.001, 0.0);
     pub const MICROSECONDS: Unit = Unit::derived("µs", Quantity::Duration, 0.001, 0.0);
@@ -139,6 +143,7 @@ impl Reading {
         celsius => CELSIUS, fahrenheit => FAHRENHEIT, kelvin => KELVIN,
         kpa => KPA, psi => PSI, bar => BAR, inhg => INHG,
         kmh => KMH, mph => MPH,
+        kilometres => KILOMETRES, miles => MILES,
         volts => VOLT, millivolts => MILLIVOLT,
         afr => AFR, lambda => LAMBDA,
         ms => MS, microseconds => MICROSECONDS,
